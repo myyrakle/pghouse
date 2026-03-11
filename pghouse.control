@@ -1,0 +1,5 @@
+comment = 'Block-oriented analytics table bootstrap for PostgreSQL'
+default_version = '0.1.0'
+module_pathname = '$libdir/pghouse'
+relocatable = false
+superuser = true
