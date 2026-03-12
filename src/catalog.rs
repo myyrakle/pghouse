@@ -20,6 +20,7 @@ pub(crate) struct TableConfig {
     pub(crate) pk_column: String,
     pub(crate) granule_rows: i32,
     pub(crate) compression: String,
+    pub(crate) storage_root: String,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,7 @@ impl From<&TableConfig> for TableDescriptor {
             pk_column: value.pk_column.clone(),
             granule_rows: usize::try_from(value.granule_rows.max(1)).unwrap_or(1),
             compression: value.compression.clone(),
+            storage_root: value.storage_root.clone(),
         }
     }
 }
@@ -65,6 +67,7 @@ pgrx::extension_sql!(
         pk_column name NOT NULL,
         granule_rows integer NOT NULL CHECK (granule_rows > 0),
         compression text NOT NULL CHECK (compression IN ('zstd')),
+        storage_root text NOT NULL,
         registered_at timestamptz NOT NULL DEFAULT now(),
         last_flush_at timestamptz,
         last_merge_at timestamptz
@@ -118,7 +121,7 @@ pgrx::extension_sql!(
         row_count integer NOT NULL,
         uncompressed_bytes integer NOT NULL,
         compressed_bytes integer NOT NULL,
-        payload bytea NOT NULL,
+        storage_path text NOT NULL,
         PRIMARY KEY (granule_id, column_name)
     );
 
@@ -250,6 +253,7 @@ pub(crate) fn upsert_table_config(
     pk_column: &str,
     granule_rows: i32,
     compression: &str,
+    storage_root: &str,
 ) -> anyhow::Result<()> {
     let args = [
         DatumWithOid::from(identity.table_oid),
@@ -257,6 +261,7 @@ pub(crate) fn upsert_table_config(
         DatumWithOid::from(pk_column),
         DatumWithOid::from(granule_rows),
         DatumWithOid::from(compression),
+        DatumWithOid::from(storage_root),
     ];
 
     Spi::run_with_args(
@@ -266,20 +271,23 @@ pub(crate) fn upsert_table_config(
             table_name,
             pk_column,
             granule_rows,
-            compression
+            compression,
+            storage_root
         )
         VALUES (
             $1::oid,
             $2::oid::regclass,
             $3,
             $4,
-            $5
+            $5,
+            $6
         )
         ON CONFLICT (table_oid)
         DO UPDATE SET
             pk_column = EXCLUDED.pk_column,
             granule_rows = EXCLUDED.granule_rows,
-            compression = EXCLUDED.compression
+            compression = EXCLUDED.compression,
+            storage_root = EXCLUDED.storage_root
         "#,
         &args,
     )?;
@@ -367,7 +375,8 @@ pub(crate) fn load_table_config(table_oid: i64) -> anyhow::Result<TableConfig> {
                 c.relname::text AS relname,
                 t.pk_column::text AS pk_column,
                 t.granule_rows AS granule_rows,
-                t.compression::text AS compression
+                t.compression::text AS compression,
+                t.storage_root::text AS storage_root
             FROM pghouse.tables t
             JOIN pg_class c ON c.oid = t.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -392,6 +401,9 @@ pub(crate) fn load_table_config(table_oid: i64) -> anyhow::Result<TableConfig> {
                     .unwrap_or_default(),
                 compression: row
                     .get_by_name::<String, _>("compression")?
+                    .unwrap_or_default(),
+                storage_root: row
+                    .get_by_name::<String, _>("storage_root")?
                     .unwrap_or_default(),
             }))
         } else {
@@ -733,7 +745,7 @@ pub(crate) fn insert_column_chunk(
     row_count: i32,
     uncompressed_bytes: i32,
     compressed_bytes: i32,
-    payload: Vec<u8>,
+    storage_path: &str,
 ) -> anyhow::Result<()> {
     let args = [
         DatumWithOid::from(granule_id),
@@ -743,7 +755,7 @@ pub(crate) fn insert_column_chunk(
         DatumWithOid::from(row_count),
         DatumWithOid::from(uncompressed_bytes),
         DatumWithOid::from(compressed_bytes),
-        DatumWithOid::from(payload),
+        DatumWithOid::from(storage_path),
     ];
 
     Spi::run_with_args(
@@ -756,7 +768,7 @@ pub(crate) fn insert_column_chunk(
             row_count,
             uncompressed_bytes,
             compressed_bytes,
-            payload
+            storage_path
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
@@ -800,21 +812,39 @@ pub(crate) fn mark_merge_failure(table_oid: i64, error_text: &str) -> anyhow::Re
 
 pub(crate) fn delete_stale_granules(
     table_oid: i64,
-    min_generation_to_keep: i64,
+    min_generation_to_keep: Option<i64>,
 ) -> anyhow::Result<()> {
-    let args = [
-        DatumWithOid::from(table_oid),
-        DatumWithOid::from(min_generation_to_keep),
-    ];
+    match min_generation_to_keep {
+        Some(min_generation_to_keep) => {
+            let args = [
+                DatumWithOid::from(table_oid),
+                DatumWithOid::from(min_generation_to_keep),
+            ];
 
-    Spi::run_with_args(
-        r#"
-        DELETE FROM pghouse.granules
-        WHERE table_oid = $1::oid
-          AND generation < $2
-        "#,
-        &args,
-    )?;
+            Spi::run_with_args(
+                r#"
+                DELETE FROM pghouse.granules
+                WHERE table_oid = $1::oid
+                  AND generation < $2
+                "#,
+                &args,
+            )?;
+        }
+        None => {
+            let args = [DatumWithOid::from(table_oid)];
+            Spi::run_with_args(
+                r#"
+                DELETE FROM pghouse.granules
+                WHERE table_oid = $1::oid
+                "#,
+                &args,
+            )?;
+        }
+    }
 
     Ok(())
+}
+
+pub(crate) fn delete_all_granules(table_oid: i64) -> anyhow::Result<()> {
+    delete_stale_granules(table_oid, None)
 }

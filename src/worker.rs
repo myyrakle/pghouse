@@ -1,4 +1,3 @@
-use crate::bootstrap::BootstrapSnapshotWriter;
 use crate::catalog::{
     TableConfig, apply_mutation, dirty_row_count, load_candidate_tables, load_column_specs,
     load_live_rows, load_pending_rows, load_table_config, mark_merge_failure, next_generation,
@@ -9,6 +8,7 @@ use crate::interface::{
     ChunkCodec, ColumnChunkEncodeRequest, ColumnDescriptor, GranuleSpan, GranuleWriteBatch,
     GranuleWriteRequest, RowVersion, SnapshotWriter, TableDescriptor,
 };
+use crate::storage::FileSnapshotWriter;
 use anyhow::{Context, Result};
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
@@ -83,7 +83,7 @@ fn rewrite_table_snapshot(config: &TableConfig) -> Result<usize> {
     let new_base_generation = next_generation(config.table_oid)?;
     let table = TableDescriptor::from(config);
     let codec = JsonArrayZstdCodec;
-    let writer = BootstrapSnapshotWriter;
+    let writer = FileSnapshotWriter;
 
     let mut parsed_rows = Vec::with_capacity(live_rows.len());
     for live_row in &live_rows {

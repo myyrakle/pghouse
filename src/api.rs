@@ -2,6 +2,7 @@ use crate::catalog::{
     enqueue_backfill, enqueue_merge, install_capture_trigger, relation_identity,
     reset_sidecar_state, upsert_table_config,
 };
+use crate::storage::{reset_table_storage, resolve_storage_root};
 use anyhow::{Result, bail};
 use pgrx::JsonB;
 use pgrx::prelude::*;
@@ -13,6 +14,7 @@ fn pghouse_register_table(
     pk_column: &str,
     granule_rows: default!(i32, 8192),
     compression: default!(String, "'zstd'"),
+    storage_path: default!(String, "''"),
     backfill_existing: default!(bool, true),
 ) -> JsonB {
     let response = register_table(
@@ -20,6 +22,7 @@ fn pghouse_register_table(
         pk_column,
         granule_rows,
         &compression,
+        &storage_path,
         backfill_existing,
     )
     .unwrap_or_else(|error| error!("pghouse_register_table failed: {error:#}"));
@@ -37,6 +40,7 @@ fn register_table(
     pk_column: &str,
     granule_rows: i32,
     compression: &str,
+    storage_path: &str,
     backfill_existing: bool,
 ) -> Result<serde_json::Value> {
     if granule_rows <= 0 {
@@ -47,9 +51,17 @@ fn register_table(
     }
 
     let identity = relation_identity(table_name)?;
-    upsert_table_config(&identity, pk_column, granule_rows, compression)?;
+    let storage_root = resolve_storage_root(identity.table_oid, storage_path)?;
+    upsert_table_config(
+        &identity,
+        pk_column,
+        granule_rows,
+        compression,
+        &storage_root,
+    )?;
     install_capture_trigger(&identity)?;
     reset_sidecar_state(identity.table_oid)?;
+    reset_table_storage(&storage_root)?;
 
     if backfill_existing {
         enqueue_backfill(&identity, pk_column)?;
@@ -62,6 +74,7 @@ fn register_table(
         "pk_column": pk_column,
         "granule_rows": granule_rows,
         "compression": compression,
+        "storage_root": storage_root,
         "backfill_existing": backfill_existing,
     }))
 }

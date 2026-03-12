@@ -10,6 +10,7 @@ pub struct TableDescriptor {
     pub pk_column: String,
     pub granule_rows: usize,
     pub compression: String,
+    pub storage_root: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

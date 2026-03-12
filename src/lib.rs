@@ -2,10 +2,10 @@ pgrx::pg_module_magic!();
 
 mod am;
 mod api;
-mod bootstrap;
 mod catalog;
 mod compression;
 pub mod interface;
+mod storage;
 mod worker;
 
 #[cfg(any(test, feature = "pg_test"))]
