@@ -1,4 +1,4 @@
-use crate::interface::{ChunkCodec, ColumnChunkEncodeRequest, EncodedColumnChunk};
+use crate::core::interface::{ChunkCodec, ColumnChunkEncodeRequest, EncodedColumnChunk};
 use anyhow::{Context, Result, bail};
 use std::io::Cursor;
 

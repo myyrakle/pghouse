@@ -1,14 +1,12 @@
-use crate::catalog::{
+use crate::core::codec::JsonArrayZstdCodec;
+use crate::core::interface::{ColumnDescriptor, RowVersion, SnapshotWriter};
+use crate::core::snapshot::build_snapshot_write_request;
+use crate::pg::catalog::{
     TableConfig, apply_mutation, dirty_row_count, load_candidate_tables, load_column_specs,
     load_live_rows, load_pending_rows, load_table_config, mark_merge_failure, next_generation,
     pending_merge_count,
 };
-use crate::compression::JsonArrayZstdCodec;
-use crate::interface::{
-    ChunkCodec, ColumnChunkEncodeRequest, ColumnDescriptor, GranuleSpan, GranuleWriteBatch,
-    GranuleWriteRequest, RowVersion, SnapshotWriter, TableDescriptor,
-};
-use crate::storage::FileSnapshotWriter;
+use crate::pg::storage::FileSnapshotWriter;
 use anyhow::{Context, Result};
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::prelude::*;
@@ -80,30 +78,12 @@ fn maintain_table(table_oid: i64, pending_limit: i32) -> Result<MaintenanceStats
 fn rewrite_table_snapshot(config: &TableConfig) -> Result<usize> {
     let live_rows = load_live_rows(config.table_oid)?;
     let columns = load_column_specs(config.table_oid)?;
-    let new_base_generation = next_generation(config.table_oid)?;
-    let table = TableDescriptor::from(config);
+    let base_generation = next_generation(config.table_oid)?;
+    let table = crate::core::interface::TableDescriptor::from(config);
     let codec = JsonArrayZstdCodec;
     let writer = FileSnapshotWriter;
 
-    let mut parsed_rows = Vec::with_capacity(live_rows.len());
-    for live_row in &live_rows {
-        let row = serde_json::from_str::<Value>(&live_row.row_json)
-            .with_context(|| format!("failed to parse row JSON for pk {}", live_row.pk_text))?;
-        parsed_rows.push(RowVersion {
-            pk_text: live_row.pk_text.clone(),
-            row_json: row,
-        });
-    }
-
-    if parsed_rows.is_empty() {
-        writer.replace_snapshot(&GranuleWriteRequest {
-            table,
-            granules: Vec::new(),
-        })?;
-        return Ok(0);
-    }
-
-    let granule_size = usize::try_from(config.granule_rows.max(1)).unwrap_or(1);
+    let parsed_rows = parse_live_rows(&live_rows)?;
     let column_descriptors = columns
         .iter()
         .map(|column| ColumnDescriptor {
@@ -111,39 +91,31 @@ fn rewrite_table_snapshot(config: &TableConfig) -> Result<usize> {
             name: column.attname.clone(),
         })
         .collect::<Vec<_>>();
-    let mut granules = Vec::new();
+    let request = build_snapshot_write_request(
+        table,
+        &column_descriptors,
+        &parsed_rows,
+        base_generation,
+        "background_merge",
+        &codec,
+    )?;
 
-    for (index, chunk) in parsed_rows.chunks(granule_size).enumerate() {
-        let generation = new_base_generation + i64::try_from(index).unwrap_or_default();
-        let pk_min = chunk.first().map(|row| row.pk_text.clone());
-        let pk_max = chunk.last().map(|row| row.pk_text.clone());
-
-        let mut encoded_chunks = Vec::with_capacity(column_descriptors.len());
-        for column in &column_descriptors {
-            let request = ColumnChunkEncodeRequest {
-                table: table.clone(),
-                column: column.clone(),
-                rows: chunk.to_vec(),
-                codec: table.compression.clone(),
-            };
-            encoded_chunks.push(codec.encode(&request)?);
-        }
-
-        granules.push(GranuleWriteBatch {
-            span: GranuleSpan {
-                generation,
-                row_count: i32::try_from(chunk.len()).unwrap_or(i32::MAX),
-                pk_min,
-                pk_max,
-                merge_reason: "background_merge".to_string(),
-            },
-            chunks: encoded_chunks,
-        });
-    }
-
-    writer.replace_snapshot(&GranuleWriteRequest { table, granules })?;
+    writer.replace_snapshot(&request)?;
 
     Ok(parsed_rows.len())
+}
+
+fn parse_live_rows(live_rows: &[crate::pg::catalog::LiveRow]) -> Result<Vec<RowVersion>> {
+    let mut parsed_rows = Vec::with_capacity(live_rows.len());
+    for live_row in live_rows {
+        let row = serde_json::from_str::<Value>(&live_row.row_json)
+            .with_context(|| format!("failed to parse row JSON for pk {}", live_row.pk_text))?;
+        parsed_rows.push(RowVersion {
+            pk_text: live_row.pk_text.clone(),
+            row_json: row,
+        });
+    }
+    Ok(parsed_rows)
 }
 
 #[pg_extern]

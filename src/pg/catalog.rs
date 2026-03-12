@@ -1,5 +1,5 @@
-use crate::interface::TableDescriptor;
-use anyhow::{Context, anyhow, bail};
+use crate::core::interface::TableDescriptor;
+use anyhow::{Context, Result, anyhow, bail};
 use pgrx::prelude::*;
 use pgrx::spi::{quote_identifier, quote_qualified_identifier};
 use pgrx::{Spi, datum::DatumWithOid};

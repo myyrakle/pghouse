@@ -1,12 +1,10 @@
 pgrx::pg_module_magic!();
 
-mod am;
-mod api;
-mod catalog;
-mod compression;
-pub mod interface;
-mod storage;
-mod worker;
+pub mod core;
+pub mod interface {
+    pub use crate::core::interface::*;
+}
+mod pg;
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]

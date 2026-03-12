@@ -1,8 +1,8 @@
-use crate::catalog::{
+use crate::pg::catalog::{
     enqueue_backfill, enqueue_merge, install_capture_trigger, relation_identity,
     reset_sidecar_state, upsert_table_config,
 };
-use crate::storage::{reset_table_storage, resolve_storage_root};
+use crate::pg::storage::{reset_table_storage, resolve_storage_root};
 use anyhow::{Result, bail};
 use pgrx::JsonB;
 use pgrx::prelude::*;

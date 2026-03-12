@@ -1,0 +1,123 @@
+use anyhow::{Context, Result};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn reset_storage_root(storage_root: &str) -> Result<()> {
+    let root = Path::new(storage_root);
+    if root.exists() {
+        fs::remove_dir_all(root)
+            .with_context(|| format!("failed to remove storage root {}", root.display()))?;
+    }
+    fs::create_dir_all(root)
+        .with_context(|| format!("failed to create storage root {}", root.display()))?;
+    Ok(())
+}
+
+pub(crate) fn cleanup_generation_dirs(
+    table_root: &Path,
+    min_generation_to_keep: Option<i64>,
+) -> Result<()> {
+    if !table_root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(table_root)
+        .with_context(|| format!("failed to list storage root {}", table_root.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(generation) = parse_generation_dir_name(name) else {
+            continue;
+        };
+
+        let should_delete = match min_generation_to_keep {
+            Some(min_generation) => generation < min_generation,
+            None => true,
+        };
+
+        if should_delete {
+            fs::remove_dir_all(entry.path()).with_context(|| {
+                format!(
+                    "failed to remove stale granule directory {}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn write_chunk_file(path: &Path, payload: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    let mut file = fs::File::create(&tmp_path)
+        .with_context(|| format!("failed to create chunk temp file {}", tmp_path.display()))?;
+    file.write_all(payload)
+        .with_context(|| format!("failed to write chunk temp file {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync chunk temp file {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to move chunk temp file {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn granule_dir_name(generation: i64) -> String {
+    format!("g{generation:020}")
+}
+
+pub(crate) fn chunk_file_name(column_ordinal: i32, column_name: &str, codec: &str) -> String {
+    let safe_name = sanitize_path_component(column_name);
+    format!("c{column_ordinal:04}_{safe_name}.{codec}.bin")
+}
+
+pub(crate) fn chunk_relative_path(
+    generation: i64,
+    column_ordinal: i32,
+    column_name: &str,
+    codec: &str,
+) -> PathBuf {
+    PathBuf::from(granule_dir_name(generation)).join(chunk_file_name(
+        column_ordinal,
+        column_name,
+        codec,
+    ))
+}
+
+fn parse_generation_dir_name(name: &str) -> Option<i64> {
+    name.strip_prefix('g')?.parse::<i64>().ok()
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "column".to_string()
+    } else {
+        output
+    }
+}
