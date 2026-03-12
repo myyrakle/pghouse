@@ -6,8 +6,17 @@ pub mod interface {
 }
 mod pg;
 
+#[cfg(feature = "pg_test")]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        Vec::new()
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use pgrx::prelude::*;
 

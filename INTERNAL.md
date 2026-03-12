@@ -169,12 +169,12 @@ maintenance orchestration.
 4. dirty/live row를 PK 순서로 읽음
 5. granule 단위로 column chunk 생성 및 압축
 6. 파일을 `storage_root` 아래에 기록
-7. granule/chunk metadata를 `pghouse.granules`, `pghouse.column_chunks`에 기록
+7. granule locator metadata를 `pghouse.granules`에 기록하고, column chunk 상세는 granule별 `manifest.json`에 기록
 
 즉 현재는:
 
 - base row storage: heap
-- analytics sidecar storage: pghouse file-backed granules
+- analytics sidecar storage: pghouse file-backed granules + per-granule manifest
 
 ## `extension_sql!` 사용 기준
 

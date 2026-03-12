@@ -1,4 +1,4 @@
-use crate::core::interface::TableDescriptor;
+use crate::core::interface::{ColumnDescriptor, GranuleRef, TableDescriptor};
 use anyhow::{Context, Result, anyhow, bail};
 use pgrx::prelude::*;
 use pgrx::spi::{quote_identifier, quote_qualified_identifier};
@@ -100,29 +100,14 @@ pgrx::extension_sql!(
         ON pghouse.row_versions (table_oid, dirty, deleted, pk_text);
 
     CREATE TABLE pghouse.granules (
-        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         table_oid oid NOT NULL REFERENCES pghouse.tables(table_oid) ON DELETE CASCADE,
         generation bigint NOT NULL,
         row_count integer NOT NULL,
         pk_min text,
         pk_max text,
-        codec text NOT NULL,
-        merge_reason text NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
-    );
-    CREATE UNIQUE INDEX pghouse_granules_generation_idx
-        ON pghouse.granules (table_oid, generation);
-
-    CREATE TABLE pghouse.column_chunks (
-        granule_id bigint NOT NULL REFERENCES pghouse.granules(id) ON DELETE CASCADE,
-        column_name name NOT NULL,
-        column_ordinal integer NOT NULL,
-        compression text NOT NULL,
-        row_count integer NOT NULL,
-        uncompressed_bytes integer NOT NULL,
-        compressed_bytes integer NOT NULL,
-        storage_path text NOT NULL,
-        PRIMARY KEY (granule_id, column_name)
+        manifest_path text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (table_oid, generation)
     );
 
     CREATE TABLE pghouse.merge_queue (
@@ -550,6 +535,87 @@ pub(crate) fn load_column_specs(table_oid: i64) -> anyhow::Result<Vec<ColumnSpec
     Ok(columns)
 }
 
+pub(crate) fn resolve_projection(
+    table_oid: i64,
+    requested_columns: &[String],
+) -> anyhow::Result<Vec<ColumnDescriptor>> {
+    let available_columns = load_column_specs(table_oid)?;
+    if requested_columns.is_empty() {
+        return Ok(available_columns
+            .into_iter()
+            .map(|column| ColumnDescriptor {
+                ordinal: column.attnum,
+                name: column.attname,
+            })
+            .collect());
+    }
+
+    let mut projection = Vec::with_capacity(requested_columns.len());
+    for requested_column in requested_columns {
+        let column = available_columns
+            .iter()
+            .find(|column| column.attname == *requested_column)
+            .ok_or_else(|| {
+                anyhow!("column {requested_column} does not exist on table oid {table_oid}")
+            })?;
+        projection.push(ColumnDescriptor {
+            ordinal: column.attnum,
+            name: column.attname.clone(),
+        });
+    }
+
+    Ok(projection)
+}
+
+pub(crate) fn load_scan_granules(
+    table_oid: i64,
+    snapshot_generation: Option<i64>,
+) -> anyhow::Result<Vec<GranuleRef>> {
+    let args = [
+        DatumWithOid::from(table_oid),
+        snapshot_generation
+            .map(DatumWithOid::from)
+            .unwrap_or_else(DatumWithOid::null::<i64>),
+    ];
+
+    let granules = Spi::connect(|client| -> Result<Vec<GranuleRef>, spi::Error> {
+        let rows = client.select(
+            r#"
+            SELECT
+                table_oid::bigint AS table_oid,
+                generation::bigint AS generation,
+                row_count AS row_count,
+                pk_min::text AS pk_min,
+                pk_max::text AS pk_max,
+                manifest_path::text AS manifest_path
+            FROM pghouse.granules
+            WHERE table_oid = $1::oid
+              AND ($2 IS NULL OR generation <= $2)
+            ORDER BY generation
+            "#,
+            None,
+            &args,
+        )?;
+
+        let mut granules = Vec::new();
+        for row in rows {
+            granules.push(GranuleRef {
+                table_oid: row.get_by_name::<i64, _>("table_oid")?.unwrap_or_default(),
+                generation: row.get_by_name::<i64, _>("generation")?.unwrap_or_default(),
+                row_count: row.get_by_name::<i32, _>("row_count")?.unwrap_or_default(),
+                pk_min: row.get_by_name::<String, _>("pk_min")?,
+                pk_max: row.get_by_name::<String, _>("pk_max")?,
+                manifest_path: row
+                    .get_by_name::<String, _>("manifest_path")?
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(granules)
+    })?;
+
+    Ok(granules)
+}
+
 pub(crate) fn pending_merge_count(table_oid: i64) -> anyhow::Result<i64> {
     let args = [DatumWithOid::from(table_oid)];
     let count = Spi::get_one_with_args::<i64>(
@@ -695,20 +761,18 @@ pub(crate) fn insert_granule(
     row_count: i32,
     pk_min: Option<&str>,
     pk_max: Option<&str>,
-    codec: &str,
-    merge_reason: &str,
-) -> anyhow::Result<i64> {
+    manifest_path: &str,
+) -> anyhow::Result<()> {
     let args = [
         DatumWithOid::from(table_oid),
         DatumWithOid::from(generation),
         DatumWithOid::from(row_count),
         pk_min.map_or_else(|| DatumWithOid::null::<String>(), DatumWithOid::from),
         pk_max.map_or_else(|| DatumWithOid::null::<String>(), DatumWithOid::from),
-        DatumWithOid::from(codec),
-        DatumWithOid::from(merge_reason),
+        DatumWithOid::from(manifest_path),
     ];
 
-    let granule_id = Spi::get_one_with_args::<i64>(
+    Spi::run_with_args(
         r#"
         INSERT INTO pghouse.granules (
             table_oid,
@@ -716,8 +780,7 @@ pub(crate) fn insert_granule(
             row_count,
             pk_min,
             pk_max,
-            codec,
-            merge_reason
+            manifest_path
         )
         VALUES (
             $1::oid,
@@ -725,55 +788,12 @@ pub(crate) fn insert_granule(
             $3,
             $4,
             $5,
-            $6,
-            $7
+            $6
         )
-        RETURNING id::bigint
         "#,
         &args,
-    )?
-    .context("failed to insert granule")?;
-
-    Ok(granule_id)
-}
-
-pub(crate) fn insert_column_chunk(
-    granule_id: i64,
-    column_name: &str,
-    column_ordinal: i32,
-    compression: &str,
-    row_count: i32,
-    uncompressed_bytes: i32,
-    compressed_bytes: i32,
-    storage_path: &str,
-) -> anyhow::Result<()> {
-    let args = [
-        DatumWithOid::from(granule_id),
-        DatumWithOid::from(column_name),
-        DatumWithOid::from(column_ordinal),
-        DatumWithOid::from(compression),
-        DatumWithOid::from(row_count),
-        DatumWithOid::from(uncompressed_bytes),
-        DatumWithOid::from(compressed_bytes),
-        DatumWithOid::from(storage_path),
-    ];
-
-    Spi::run_with_args(
-        r#"
-        INSERT INTO pghouse.column_chunks (
-            granule_id,
-            column_name,
-            column_ordinal,
-            compression,
-            row_count,
-            uncompressed_bytes,
-            compressed_bytes,
-            storage_path
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        "#,
-        &args,
-    )?;
+    )
+    .context("failed to insert granule metadata")?;
 
     Ok(())
 }

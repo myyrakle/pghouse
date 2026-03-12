@@ -1,10 +1,12 @@
 use crate::core::file_layout::{
-    chunk_relative_path, cleanup_generation_dirs, reset_storage_root, write_chunk_file,
+    chunk_relative_path, cleanup_generation_dirs, manifest_relative_path, reset_storage_root,
+    write_chunk_file, write_json_file,
 };
-use crate::core::interface::{GranuleWriteRequest, GranuleWriteResult, SnapshotWriter};
+use crate::core::interface::{
+    ChunkManifestEntry, GranuleManifest, GranuleWriteRequest, GranuleWriteResult, SnapshotWriter,
+};
 use crate::pg::catalog::{
-    delete_all_granules, delete_stale_granules, insert_column_chunk, insert_granule,
-    mark_merge_success,
+    delete_all_granules, delete_stale_granules, insert_granule, mark_merge_success,
 };
 use anyhow::{Context, Result, bail};
 use pgrx::pg_sys;
@@ -58,16 +60,14 @@ impl SnapshotWriter for FileSnapshotWriter {
                 )
             })?;
 
-            let granule_id = insert_granule(
-                request.table.table_oid,
-                granule.span.generation,
-                granule.span.row_count,
-                granule.span.pk_min.as_deref(),
-                granule.span.pk_max.as_deref(),
-                &request.table.compression,
-                &granule.span.merge_reason,
-            )?;
-
+            let mut manifest = GranuleManifest {
+                table_oid: request.table.table_oid,
+                generation: granule.span.generation,
+                row_count: granule.span.row_count,
+                pk_min: granule.span.pk_min.clone(),
+                pk_max: granule.span.pk_max.clone(),
+                chunks: Vec::with_capacity(granule.chunks.len()),
+            };
             for chunk in &granule.chunks {
                 let relative_path = chunk_relative_path(
                     granule.span.generation,
@@ -77,18 +77,27 @@ impl SnapshotWriter for FileSnapshotWriter {
                 );
                 let absolute_path = table_root.join(&relative_path);
                 write_chunk_file(&absolute_path, &chunk.payload)?;
-
-                insert_column_chunk(
-                    granule_id,
-                    &chunk.column.name,
-                    chunk.column.ordinal,
-                    &chunk.codec,
-                    chunk.row_count,
-                    chunk.uncompressed_bytes,
-                    chunk.compressed_bytes,
-                    &relative_path.to_string_lossy(),
-                )?;
+                manifest.chunks.push(ChunkManifestEntry {
+                    column: chunk.column.clone(),
+                    codec: chunk.codec.clone(),
+                    row_count: chunk.row_count,
+                    uncompressed_bytes: chunk.uncompressed_bytes,
+                    compressed_bytes: chunk.compressed_bytes,
+                    storage_path: relative_path.to_string_lossy().into_owned(),
+                });
             }
+
+            let manifest_relative_path = manifest_relative_path(granule.span.generation);
+            let manifest_absolute_path = table_root.join(&manifest_relative_path);
+            write_json_file(&manifest_absolute_path, &manifest)?;
+            insert_granule(
+                request.table.table_oid,
+                granule.span.generation,
+                granule.span.row_count,
+                granule.span.pk_min.as_deref(),
+                granule.span.pk_max.as_deref(),
+                &manifest_relative_path.to_string_lossy(),
+            )?;
         }
 
         cleanup_generation_dirs(&table_root, first_generation)?;

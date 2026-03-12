@@ -93,6 +93,27 @@ pub struct GranuleRef {
     pub row_count: i32,
     pub pk_min: Option<String>,
     pub pk_max: Option<String>,
+    pub manifest_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkManifestEntry {
+    pub column: ColumnDescriptor,
+    pub codec: String,
+    pub row_count: i32,
+    pub uncompressed_bytes: i32,
+    pub compressed_bytes: i32,
+    pub storage_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GranuleManifest {
+    pub table_oid: i64,
+    pub generation: i64,
+    pub row_count: i32,
+    pub pk_min: Option<String>,
+    pub pk_max: Option<String>,
+    pub chunks: Vec<ChunkManifestEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +131,9 @@ pub struct ScanPlan {
     pub table: TableDescriptor,
     pub projection: Vec<ColumnDescriptor>,
     pub granules: Vec<GranuleRef>,
+    pub pk_min: Option<String>,
+    pub pk_max: Option<String>,
+    pub limit: Option<usize>,
     pub row_estimate: usize,
 }
 

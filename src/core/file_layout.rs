@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::{Serialize, de::DeserializeOwned};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -80,6 +81,19 @@ pub(crate) fn write_chunk_file(path: &Path, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("failed to serialize json file {}", path.display()))?;
+    write_chunk_file(path, &payload)
+}
+
+pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let payload =
+        fs::read(path).with_context(|| format!("failed to read json file {}", path.display()))?;
+    serde_json::from_slice(&payload)
+        .with_context(|| format!("failed to decode json file {}", path.display()))
+}
+
 pub(crate) fn granule_dir_name(generation: i64) -> String {
     format!("g{generation:020}")
 }
@@ -100,6 +114,14 @@ pub(crate) fn chunk_relative_path(
         column_name,
         codec,
     ))
+}
+
+pub(crate) fn manifest_file_name() -> &'static str {
+    "manifest.json"
+}
+
+pub(crate) fn manifest_relative_path(generation: i64) -> PathBuf {
+    PathBuf::from(granule_dir_name(generation)).join(manifest_file_name())
 }
 
 fn parse_generation_dir_name(name: &str) -> Option<i64> {
