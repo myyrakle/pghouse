@@ -3,6 +3,12 @@ use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone)]
+pub(crate) struct MaterializedRow {
+    pub(crate) pk_text: Option<String>,
+    pub(crate) row: Value,
+}
+
 pub(crate) fn build_scan_plan(
     request: &ScanRequest,
     available_granules: &[GranuleRef],
@@ -51,7 +57,10 @@ pub(crate) fn build_scan_plan(
     })
 }
 
-pub(crate) fn materialize_rows(plan: &ScanPlan, batches: &[ScanBatch]) -> Result<Vec<Value>> {
+pub(crate) fn materialize_row_entries(
+    plan: &ScanPlan,
+    batches: &[ScanBatch],
+) -> Result<Vec<MaterializedRow>> {
     let mut rows = Vec::new();
     let projected_columns = plan
         .projection
@@ -95,7 +104,10 @@ pub(crate) fn materialize_rows(plan: &ScanPlan, batches: &[ScanBatch]) -> Result
                 row.insert(column_descriptor.name.clone(), value.clone());
             }
 
-            rows.push(Value::Object(row));
+            rows.push(MaterializedRow {
+                pk_text: pk_value,
+                row: Value::Object(row),
+            });
             if let Some(limit) = plan.limit
                 && rows.len() >= limit
             {
@@ -149,17 +161,13 @@ fn batch_row_count(batch: &ScanBatch) -> Result<usize> {
 }
 
 fn load_pk_value(plan: &ScanPlan, batch: &ScanBatch, row_index: usize) -> Result<Option<String>> {
-    if plan.pk_min.is_none() && plan.pk_max.is_none() {
-        return Ok(None);
-    }
-
     let pk_column = batch
         .columns
         .iter()
         .find(|column| column.column.name == plan.table.pk_column)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "scan batch for generation {} is missing PK column {} required for filtering",
+                "scan batch for generation {} is missing PK column {}",
                 batch.granule.generation,
                 plan.table.pk_column
             )
@@ -204,7 +212,7 @@ fn value_to_pk_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_scan_plan, materialize_rows};
+    use super::{build_scan_plan, materialize_row_entries};
     use crate::core::interface::{
         ColumnDescriptor, ColumnVector, GranuleRef, ScanBatch, ScanRequest, TableDescriptor,
     };
@@ -296,7 +304,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let rows = materialize_rows(
+        let rows = materialize_row_entries(
             &plan,
             &[ScanBatch {
                 granule: plan.granules[0].clone(),
@@ -320,6 +328,61 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rows, vec![json!({"payload": {"a": 2}})]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row, json!({"payload": {"a": 2}}));
+    }
+
+    #[test]
+    fn materialize_row_entries_keeps_pk_outside_projection() {
+        let request = ScanRequest {
+            table: test_table(),
+            projection: vec![ColumnDescriptor {
+                ordinal: 2,
+                name: "payload".to_string(),
+            }],
+            pk_min: None,
+            pk_max: None,
+            limit: None,
+            snapshot_generation: None,
+        };
+        let plan = build_scan_plan(
+            &request,
+            &[GranuleRef {
+                table_oid: 1,
+                generation: 1,
+                row_count: 1,
+                pk_min: Some("1".to_string()),
+                pk_max: Some("1".to_string()),
+                manifest_path: "g00000000000000000001/manifest.json".to_string(),
+            }],
+        )
+        .unwrap();
+        let rows = materialize_row_entries(
+            &plan,
+            &[ScanBatch {
+                granule: plan.granules[0].clone(),
+                columns: vec![
+                    ColumnVector {
+                        column: ColumnDescriptor {
+                            ordinal: 1,
+                            name: "id".to_string(),
+                        },
+                        values: vec![json!(1)],
+                    },
+                    ColumnVector {
+                        column: ColumnDescriptor {
+                            ordinal: 2,
+                            name: "payload".to_string(),
+                        },
+                        values: vec![json!({"a": 1})],
+                    },
+                ],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pk_text.as_deref(), Some("1"));
+        assert_eq!(rows[0].row, json!({"payload": {"a": 1}}));
     }
 }

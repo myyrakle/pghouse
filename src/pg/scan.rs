@@ -1,12 +1,14 @@
 use crate::core::codec::JsonArrayZstdCodec;
-use crate::core::file_layout::read_json_file;
+use crate::core::file_layout::{read_json_file, read_json_lines};
 use crate::core::interface::{
     ChunkCodec, ColumnDescriptor, ColumnVector, EncodedColumnChunk, GranuleManifest, GranuleReader,
     GranuleRef, ScanBatch, ScanPlan, ScanPlanner, ScanRequest,
 };
-use crate::core::scan::{build_scan_plan, materialize_rows};
-use crate::pg::catalog::load_scan_granules;
+use crate::core::scan::{MaterializedRow, build_scan_plan, materialize_row_entries};
+use crate::pg::catalog::{load_scan_granules, load_visible_insert_buffers};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -94,16 +96,21 @@ pub(crate) fn execute_scan(plan: &ScanPlan) -> Result<Vec<serde_json::Value>> {
     for granule in &plan.granules {
         batches.push(reader.read_granule(plan, granule)?);
     }
-    materialize_rows(plan, &batches)
+
+    let mut rows = materialize_row_entries(plan, &batches)?;
+    rows.extend(load_buffered_rows(plan)?);
+    rows.sort_by(|left, right| left.pk_text.cmp(&right.pk_text));
+
+    if let Some(limit) = plan.limit {
+        rows.truncate(limit);
+    }
+
+    Ok(rows.into_iter().map(|row| row.row).collect())
 }
 
 fn required_columns(plan: &ScanPlan) -> Vec<ColumnDescriptor> {
     let mut columns = plan.projection.clone();
-    if (plan.pk_min.is_some() || plan.pk_max.is_some())
-        && !columns
-            .iter()
-            .any(|column| column.name == plan.table.pk_column)
-    {
+    if !columns.iter().any(|column| column.name == plan.table.pk_column) {
         columns.push(ColumnDescriptor {
             ordinal: 0,
             name: plan.table.pk_column.clone(),
@@ -124,4 +131,62 @@ fn load_granule_manifest(plan: &ScanPlan, granule: &GranuleRef) -> Result<Granul
         );
     }
     Ok(manifest)
+}
+
+#[derive(Debug, Deserialize)]
+struct BufferedInsertRecord {
+    pk_text: String,
+    row_json: Value,
+}
+
+fn load_buffered_rows(plan: &ScanPlan) -> Result<Vec<MaterializedRow>> {
+    let buffers = load_visible_insert_buffers(plan.table.table_oid)?;
+    let mut rows = Vec::new();
+
+    for buffer in buffers {
+        let path = PathBuf::from(&plan.table.storage_root).join(&buffer.storage_path);
+        let staged_rows = read_json_lines::<BufferedInsertRecord>(&path)
+            .with_context(|| format!("failed to read insert buffer {}", path.display()))?;
+        for staged_row in staged_rows {
+            if !pk_matches_bounds(
+                &staged_row.pk_text,
+                plan.pk_min.as_deref(),
+                plan.pk_max.as_deref(),
+            ) {
+                continue;
+            }
+            rows.push(MaterializedRow {
+                pk_text: Some(staged_row.pk_text),
+                row: project_row(&staged_row.row_json, &plan.projection),
+            });
+        }
+    }
+
+    Ok(rows)
+}
+
+fn project_row(row_json: &Value, projection: &[ColumnDescriptor]) -> Value {
+    match row_json {
+        Value::Object(object) => {
+            let mut projected = Map::with_capacity(projection.len());
+            for column in projection {
+                let value = object.get(&column.name).cloned().unwrap_or(Value::Null);
+                projected.insert(column.name.clone(), value);
+            }
+            Value::Object(projected)
+        }
+        _ => Value::Object(Map::new()),
+    }
+}
+
+fn pk_matches_bounds(value: &str, pk_min: Option<&str>, pk_max: Option<&str>) -> bool {
+    if pk_min.is_some_and(|bound| value < bound) {
+        return false;
+    }
+
+    if pk_max.is_some_and(|bound| value > bound) {
+        return false;
+    }
+
+    true
 }

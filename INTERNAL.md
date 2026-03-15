@@ -9,7 +9,8 @@
 - `CREATE TABLE ... USING pghouse` 가능
 - 실제 table AM read/write 엔진은 아직 heap delegate
 - 별도 sidecar metadata와 granule 파일 저장 경로를 사용
-- background maintenance가 mutation을 흡수하고 granule snapshot을 재작성
+- insert는 file-backed buffer에 먼저 적재되고, background maintenance가 granule로 flush
+- update/delete는 비동기 mutation으로 흡수한 뒤 granule snapshot을 재작성
 
 ## 상위 구조
 
@@ -148,11 +149,12 @@ maintenance orchestration.
 흐름:
 
 1. candidate table 조회
-2. `pending_rows` 적용
-3. dirty row / merge queue 검사
-4. live rows 조회
-5. `core::snapshot`으로 granule write request 생성
-6. `pg::storage` writer로 파일 및 metadata 반영
+2. ready insert buffer flush
+3. `pending_rows` 적용
+4. dirty row / merge queue 검사
+5. live rows 조회
+6. `core::snapshot`으로 granule write request 생성
+7. `pg::storage` writer로 파일 및 metadata 반영
 
 핵심 원칙:
 
@@ -164,17 +166,41 @@ maintenance orchestration.
 현재 write path는 직접 table AM write가 아니라 sidecar pipeline이다.
 
 1. 사용자가 `USING pghouse` 테이블에 DML 수행
-2. trigger `pghouse.capture_dml()`가 `pghouse.pending_rows`에 mutation 적재
-3. maintenance worker가 pending mutation을 `pghouse.row_versions`에 반영
-4. dirty/live row를 PK 순서로 읽음
-5. granule 단위로 column chunk 생성 및 압축
-6. 파일을 `storage_root` 아래에 기록
-7. granule locator metadata를 `pghouse.granules`에 기록하고, column chunk 상세는 granule별 `manifest.json`에 기록
+2. trigger `pghouse.capture_dml()`가 `INSERT`는 `pghouse_stage_insert()`로 보내고, `UPDATE/DELETE`는 `pghouse.pending_rows`에 적재
+3. `INSERT`는 `pghouse.insert_buffers` 메타와 `incoming/*.jsonl` spool file에 먼저 쌓임
+4. maintenance worker가 sealed/timeout buffer를 읽어 granule 단위로 압축해 append
+5. flush된 row는 `pghouse.row_versions`에도 upsert되어 이후 merge snapshot의 기반이 됨
+6. `UPDATE/DELETE`는 maintenance worker가 `pghouse.row_versions`에 반영
+7. dirty/live row를 PK 순서로 읽어 full rewrite가 필요하면 granule snapshot을 재작성
+8. granule locator metadata를 `pghouse.granules`에 기록하고, column chunk 상세는 granule별 `manifest.json`에 기록
 
 즉 현재는:
 
 - base row storage: heap
 - analytics sidecar storage: pghouse file-backed granules + per-granule manifest
+
+## Insert Buffer 모델
+
+ClickHouse의 `Squashing` + `AsynchronousInsertQueue`와 비슷하게, `pghouse`는 insert를 바로 granule로 쓰지 않는다.
+
+- 짧은 수명 버퍼: 트리거 호출 단위에서 JSON row를 spool file에 append
+- flush 조건:
+  - `insert_buffer_rows`
+  - `insert_buffer_bytes`
+  - `insert_flush_ms`
+- flush 결과:
+  - row들을 PK 기준 정렬
+  - `granule_rows` 기준으로 분할
+  - 컬럼별 chunk 압축
+  - granule append
+
+이 구조의 의도는 다음과 같다.
+
+- 작은 insert를 바로 granule로 쪼개지 않기
+- flush 전까지는 file-backed buffer에서 흡수하기
+- merge worker가 insert path 전체를 full rewrite로 떠안지 않게 하기
+
+현재 `pghouse_scan_rows(...)`는 committed granule뿐 아니라 아직 flush되지 않은 visible insert buffer도 함께 읽는다.
 
 ## `extension_sql!` 사용 기준
 

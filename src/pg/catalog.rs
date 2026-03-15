@@ -21,6 +21,9 @@ pub(crate) struct TableConfig {
     pub(crate) granule_rows: i32,
     pub(crate) compression: String,
     pub(crate) storage_root: String,
+    pub(crate) insert_buffer_rows: i32,
+    pub(crate) insert_buffer_bytes: i64,
+    pub(crate) insert_flush_ms: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,14 @@ pub(crate) struct LiveRow {
 pub(crate) struct ColumnSpec {
     pub(crate) attnum: i32,
     pub(crate) attname: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InsertBuffer {
+    pub(crate) id: i64,
+    pub(crate) storage_path: String,
+    pub(crate) row_count: i32,
+    pub(crate) byte_count: i64,
 }
 
 impl From<&TableConfig> for TableDescriptor {
@@ -68,15 +79,33 @@ pgrx::extension_sql!(
         granule_rows integer NOT NULL CHECK (granule_rows > 0),
         compression text NOT NULL CHECK (compression IN ('zstd')),
         storage_root text NOT NULL,
+        insert_buffer_rows integer NOT NULL CHECK (insert_buffer_rows > 0),
+        insert_buffer_bytes bigint NOT NULL CHECK (insert_buffer_bytes > 0),
+        insert_flush_ms integer NOT NULL CHECK (insert_flush_ms > 0),
         registered_at timestamptz NOT NULL DEFAULT now(),
         last_flush_at timestamptz,
         last_merge_at timestamptz
     );
 
+    CREATE TABLE pghouse.insert_buffers (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        table_oid oid NOT NULL REFERENCES pghouse.tables(table_oid) ON DELETE CASCADE,
+        storage_path text NOT NULL,
+        row_count integer NOT NULL DEFAULT 0,
+        byte_count bigint NOT NULL DEFAULT 0,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        flush_after timestamptz NOT NULL,
+        sealed_at timestamptz,
+        flush_started_at timestamptz,
+        flushed_at timestamptz
+    );
+    CREATE INDEX pghouse_insert_buffers_ready_idx
+        ON pghouse.insert_buffers (table_oid, flushed_at, flush_started_at, flush_after, id);
+
     CREATE TABLE pghouse.pending_rows (
         id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         table_oid oid NOT NULL REFERENCES pghouse.tables(table_oid) ON DELETE CASCADE,
-        op text NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
+        op text NOT NULL CHECK (op IN ('update', 'delete')),
         pk_text text NOT NULL,
         row_json jsonb,
         queued_at timestamptz NOT NULL DEFAULT now(),
@@ -155,31 +184,23 @@ pgrx::extension_sql!(
             visible_at := now() + interval '1 second';
         END IF;
 
-        INSERT INTO pghouse.pending_rows (
-            table_oid,
-            op,
-            pk_text,
-            row_json,
-            apply_after
-        )
-        VALUES (
-            TG_RELID,
-            lower(TG_OP),
-            pk_value,
-            CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE payload END,
-            visible_at
-        );
-
-        IF TG_OP IN ('UPDATE', 'DELETE') THEN
-            INSERT INTO pghouse.merge_queue (table_oid, reason)
-            VALUES (TG_RELID, lower(TG_OP) || '_captured');
+        IF TG_OP = 'INSERT' THEN
+            PERFORM pghouse_stage_insert(TG_RELID::bigint, payload);
+            RETURN NEW;
         END IF;
+
+        INSERT INTO pghouse.pending_rows (table_oid, op, pk_text, row_json, apply_after)
+        VALUES (TG_RELID, lower(TG_OP), pk_value, CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE payload END, visible_at);
+
+        INSERT INTO pghouse.merge_queue (table_oid, reason)
+        VALUES (TG_RELID, lower(TG_OP) || '_captured');
 
         RETURN COALESCE(NEW, OLD);
     END;
     $$;
     "#,
-    name = "bootstrap_pghouse_catalog"
+    name = "bootstrap_pghouse_catalog",
+    finalize
 );
 
 pub(crate) fn relation_identity(table_name: &str) -> anyhow::Result<RelationIdentity> {
@@ -239,6 +260,9 @@ pub(crate) fn upsert_table_config(
     granule_rows: i32,
     compression: &str,
     storage_root: &str,
+    insert_buffer_rows: i32,
+    insert_buffer_bytes: i64,
+    insert_flush_ms: i32,
 ) -> anyhow::Result<()> {
     let args = [
         DatumWithOid::from(identity.table_oid),
@@ -247,6 +271,9 @@ pub(crate) fn upsert_table_config(
         DatumWithOid::from(granule_rows),
         DatumWithOid::from(compression),
         DatumWithOid::from(storage_root),
+        DatumWithOid::from(insert_buffer_rows),
+        DatumWithOid::from(insert_buffer_bytes),
+        DatumWithOid::from(insert_flush_ms),
     ];
 
     Spi::run_with_args(
@@ -257,7 +284,10 @@ pub(crate) fn upsert_table_config(
             pk_column,
             granule_rows,
             compression,
-            storage_root
+            storage_root,
+            insert_buffer_rows,
+            insert_buffer_bytes,
+            insert_flush_ms
         )
         VALUES (
             $1::oid,
@@ -265,14 +295,20 @@ pub(crate) fn upsert_table_config(
             $3,
             $4,
             $5,
-            $6
+            $6,
+            $7,
+            $8,
+            $9
         )
         ON CONFLICT (table_oid)
         DO UPDATE SET
             pk_column = EXCLUDED.pk_column,
             granule_rows = EXCLUDED.granule_rows,
             compression = EXCLUDED.compression,
-            storage_root = EXCLUDED.storage_root
+            storage_root = EXCLUDED.storage_root,
+            insert_buffer_rows = EXCLUDED.insert_buffer_rows,
+            insert_buffer_bytes = EXCLUDED.insert_buffer_bytes,
+            insert_flush_ms = EXCLUDED.insert_flush_ms
         "#,
         &args,
     )?;
@@ -284,6 +320,7 @@ pub(crate) fn reset_sidecar_state(table_oid: i64) -> anyhow::Result<()> {
     let args = [DatumWithOid::from(table_oid)];
 
     for statement in [
+        "DELETE FROM pghouse.insert_buffers WHERE table_oid = $1::oid",
         "DELETE FROM pghouse.pending_rows WHERE table_oid = $1::oid",
         "DELETE FROM pghouse.row_versions WHERE table_oid = $1::oid",
         "DELETE FROM pghouse.merge_queue WHERE table_oid = $1::oid",
@@ -320,18 +357,14 @@ pub(crate) fn enqueue_backfill(identity: &RelationIdentity, pk_column: &str) -> 
 
     let query = format!(
         r#"
-        INSERT INTO pghouse.pending_rows (table_oid, op, pk_text, row_json)
-        SELECT
-            $1::oid,
-            'insert',
-            to_jsonb(src) ->> $2,
+        SELECT pghouse_stage_insert(
+            $1::bigint,
             to_jsonb(src)
+        )
         FROM {qualified_table} AS src
         "#
     );
     Spi::run_with_args(&query, &args)?;
-
-    enqueue_merge(identity.table_oid, "bootstrap_backfill")?;
 
     Ok(())
 }
@@ -361,7 +394,10 @@ pub(crate) fn load_table_config(table_oid: i64) -> anyhow::Result<TableConfig> {
                 t.pk_column::text AS pk_column,
                 t.granule_rows AS granule_rows,
                 t.compression::text AS compression,
-                t.storage_root::text AS storage_root
+                t.storage_root::text AS storage_root,
+                t.insert_buffer_rows AS insert_buffer_rows,
+                t.insert_buffer_bytes::bigint AS insert_buffer_bytes,
+                t.insert_flush_ms AS insert_flush_ms
             FROM pghouse.tables t
             JOIN pg_class c ON c.oid = t.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -390,6 +426,15 @@ pub(crate) fn load_table_config(table_oid: i64) -> anyhow::Result<TableConfig> {
                 storage_root: row
                     .get_by_name::<String, _>("storage_root")?
                     .unwrap_or_default(),
+                insert_buffer_rows: row
+                    .get_by_name::<i32, _>("insert_buffer_rows")?
+                    .unwrap_or_default(),
+                insert_buffer_bytes: row
+                    .get_by_name::<i64, _>("insert_buffer_bytes")?
+                    .unwrap_or_default(),
+                insert_flush_ms: row
+                    .get_by_name::<i32, _>("insert_flush_ms")?
+                    .unwrap_or_default(),
             }))
         } else {
             Ok(None)
@@ -407,6 +452,12 @@ pub(crate) fn load_candidate_tables(max_tables: i32) -> anyhow::Result<Vec<i64>>
             r#"
             SELECT DISTINCT table_oid::bigint
             FROM (
+                SELECT table_oid
+                FROM pghouse.insert_buffers
+                WHERE flushed_at IS NULL
+                  AND flush_started_at IS NULL
+                  AND (sealed_at IS NOT NULL OR flush_after <= now())
+                UNION ALL
                 SELECT table_oid
                 FROM pghouse.pending_rows
                 WHERE processed_at IS NULL
@@ -616,6 +667,228 @@ pub(crate) fn load_scan_granules(
     Ok(granules)
 }
 
+pub(crate) fn load_active_insert_buffer(table_oid: i64) -> anyhow::Result<Option<InsertBuffer>> {
+    let args = [DatumWithOid::from(table_oid)];
+
+    let buffer = Spi::connect(|client| -> Result<Option<InsertBuffer>, spi::Error> {
+        let mut rows = client.select(
+            r#"
+            SELECT
+                id::bigint AS id,
+                storage_path::text AS storage_path,
+                row_count AS row_count,
+                byte_count::bigint AS byte_count
+            FROM pghouse.insert_buffers
+            WHERE table_oid = $1::oid
+              AND sealed_at IS NULL
+              AND flushed_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            FOR UPDATE
+            "#,
+            Some(1),
+            &args,
+        )?;
+
+        if let Some(row) = rows.next() {
+            Ok(Some(InsertBuffer {
+                id: row.get_by_name::<i64, _>("id")?.unwrap_or_default(),
+                storage_path: row
+                    .get_by_name::<String, _>("storage_path")?
+                    .unwrap_or_default(),
+                row_count: row.get_by_name::<i32, _>("row_count")?.unwrap_or_default(),
+                byte_count: row.get_by_name::<i64, _>("byte_count")?.unwrap_or_default(),
+            }))
+        } else {
+            Ok(None)
+        }
+    })?;
+
+    Ok(buffer)
+}
+
+pub(crate) fn create_insert_buffer(
+    table_oid: i64,
+    storage_path: &str,
+    flush_after_ms: i32,
+) -> anyhow::Result<InsertBuffer> {
+    let args = [
+        DatumWithOid::from(table_oid),
+        DatumWithOid::from(storage_path),
+        DatumWithOid::from(flush_after_ms),
+    ];
+
+    let id = Spi::get_one_with_args::<i64>(
+        r#"
+        INSERT INTO pghouse.insert_buffers (table_oid, storage_path, flush_after)
+        VALUES (
+            $1::oid,
+            $2,
+            now() + make_interval(secs => 0) + ($3::double precision / 1000.0) * interval '1 second'
+        )
+        RETURNING id::bigint
+        "#,
+        &args,
+    )?
+    .context("failed to create insert buffer")?;
+
+    Ok(InsertBuffer {
+        id,
+        storage_path: storage_path.to_string(),
+        row_count: 0,
+        byte_count: 0,
+    })
+}
+
+pub(crate) fn update_insert_buffer_after_append(
+    buffer_id: i64,
+    row_delta: i32,
+    byte_delta: i64,
+    seal: bool,
+) -> anyhow::Result<()> {
+    let args = [
+        DatumWithOid::from(buffer_id),
+        DatumWithOid::from(row_delta),
+        DatumWithOid::from(byte_delta),
+        DatumWithOid::from(seal),
+    ];
+
+    Spi::run_with_args(
+        r#"
+        UPDATE pghouse.insert_buffers
+        SET row_count = row_count + $2,
+            byte_count = byte_count + $3,
+            sealed_at = CASE
+                WHEN $4 THEN COALESCE(sealed_at, now())
+                ELSE sealed_at
+            END
+        WHERE id = $1
+        "#,
+        &args,
+    )?;
+
+    Ok(())
+}
+
+pub(crate) fn claim_ready_insert_buffers(
+    table_oid: i64,
+    limit: i32,
+) -> anyhow::Result<Vec<InsertBuffer>> {
+    let args = [DatumWithOid::from(table_oid), DatumWithOid::from(limit)];
+
+    let buffers = Spi::connect(|client| -> Result<Vec<InsertBuffer>, spi::Error> {
+        let rows = client.select(
+            r#"
+            WITH ready AS (
+                SELECT id
+                FROM pghouse.insert_buffers
+                WHERE table_oid = $1::oid
+                  AND flushed_at IS NULL
+                  AND flush_started_at IS NULL
+                  AND (sealed_at IS NOT NULL OR flush_after <= now())
+                ORDER BY id
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            ),
+            claimed AS (
+                UPDATE pghouse.insert_buffers b
+                SET flush_started_at = now(),
+                    sealed_at = COALESCE(sealed_at, now())
+                FROM ready
+                WHERE b.id = ready.id
+                RETURNING b.id::bigint AS id,
+                          b.storage_path::text AS storage_path,
+                          b.row_count AS row_count,
+                          b.byte_count::bigint AS byte_count
+            )
+            SELECT * FROM claimed ORDER BY id
+            "#,
+            None,
+            &args,
+        )?;
+
+        let mut buffers = Vec::new();
+        for row in rows {
+            buffers.push(InsertBuffer {
+                id: row.get_by_name::<i64, _>("id")?.unwrap_or_default(),
+                storage_path: row
+                    .get_by_name::<String, _>("storage_path")?
+                    .unwrap_or_default(),
+                row_count: row.get_by_name::<i32, _>("row_count")?.unwrap_or_default(),
+                byte_count: row.get_by_name::<i64, _>("byte_count")?.unwrap_or_default(),
+            });
+        }
+        Ok(buffers)
+    })?;
+
+    Ok(buffers)
+}
+
+pub(crate) fn load_visible_insert_buffers(table_oid: i64) -> anyhow::Result<Vec<InsertBuffer>> {
+    let args = [DatumWithOid::from(table_oid)];
+
+    let buffers = Spi::connect(|client| -> Result<Vec<InsertBuffer>, spi::Error> {
+        let rows = client.select(
+            r#"
+            SELECT
+                id::bigint AS id,
+                storage_path::text AS storage_path,
+                row_count AS row_count,
+                byte_count::bigint AS byte_count
+            FROM pghouse.insert_buffers
+            WHERE table_oid = $1::oid
+              AND flushed_at IS NULL
+              AND flush_started_at IS NULL
+            ORDER BY id
+            "#,
+            None,
+            &args,
+        )?;
+
+        let mut buffers = Vec::new();
+        for row in rows {
+            buffers.push(InsertBuffer {
+                id: row.get_by_name::<i64, _>("id")?.unwrap_or_default(),
+                storage_path: row
+                    .get_by_name::<String, _>("storage_path")?
+                    .unwrap_or_default(),
+                row_count: row.get_by_name::<i32, _>("row_count")?.unwrap_or_default(),
+                byte_count: row.get_by_name::<i64, _>("byte_count")?.unwrap_or_default(),
+            });
+        }
+        Ok(buffers)
+    })?;
+
+    Ok(buffers)
+}
+
+pub(crate) fn mark_insert_buffer_flushed(buffer_id: i64) -> anyhow::Result<()> {
+    let args = [DatumWithOid::from(buffer_id)];
+    Spi::run_with_args(
+        r#"
+        UPDATE pghouse.insert_buffers
+        SET flushed_at = now()
+        WHERE id = $1
+        "#,
+        &args,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn release_insert_buffer_claim(buffer_id: i64) -> anyhow::Result<()> {
+    let args = [DatumWithOid::from(buffer_id)];
+    Spi::run_with_args(
+        r#"
+        UPDATE pghouse.insert_buffers
+        SET flush_started_at = NULL
+        WHERE id = $1
+          AND flushed_at IS NULL
+        "#,
+        &args,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn pending_merge_count(table_oid: i64) -> anyhow::Result<i64> {
     let args = [DatumWithOid::from(table_oid)];
     let count = Spi::get_one_with_args::<i64>(
@@ -755,6 +1028,48 @@ pub(crate) fn apply_mutation(mutation: &PendingMutation, table_oid: i64) -> anyh
     Ok(())
 }
 
+pub(crate) fn upsert_buffered_row_version(
+    table_oid: i64,
+    pk_text: &str,
+    row_json: &str,
+) -> anyhow::Result<()> {
+    let args = [
+        DatumWithOid::from(table_oid),
+        DatumWithOid::from(pk_text),
+        DatumWithOid::from(row_json),
+    ];
+
+    Spi::run_with_args(
+        r#"
+        INSERT INTO pghouse.row_versions (
+            table_oid,
+            pk_text,
+            row_json,
+            deleted,
+            dirty,
+            last_mutation_id
+        )
+        VALUES (
+            $1::oid,
+            $2,
+            $3::jsonb,
+            false,
+            false,
+            0
+        )
+        ON CONFLICT (table_oid, pk_text)
+        DO UPDATE SET
+            row_json = EXCLUDED.row_json,
+            deleted = false,
+            dirty = false,
+            updated_at = now()
+        "#,
+        &args,
+    )?;
+
+    Ok(())
+}
+
 pub(crate) fn insert_granule(
     table_oid: i64,
     generation: i64,
@@ -809,6 +1124,19 @@ pub(crate) fn mark_merge_success(table_oid: i64) -> anyhow::Result<()> {
         Spi::run_with_args(statement, &args)?;
     }
 
+    Ok(())
+}
+
+pub(crate) fn mark_flush_success(table_oid: i64) -> anyhow::Result<()> {
+    let args = [DatumWithOid::from(table_oid)];
+    Spi::run_with_args(
+        r#"
+        UPDATE pghouse.tables
+        SET last_flush_at = now()
+        WHERE table_oid = $1::oid
+        "#,
+        &args,
+    )?;
     Ok(())
 }
 
