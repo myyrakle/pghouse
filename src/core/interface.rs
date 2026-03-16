@@ -1,3 +1,4 @@
+use crate::core::pk::PkCompareMode;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +9,7 @@ pub struct TableDescriptor {
     pub schema_name: String,
     pub table_name: String,
     pub pk_column: String,
+    pub pk_compare: PkCompareMode,
     pub granule_rows: usize,
     pub compression: String,
     pub storage_root: String,

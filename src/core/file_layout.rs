@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn reset_storage_root(storage_root: &str) -> Result<()> {
@@ -122,6 +122,53 @@ pub(crate) fn manifest_file_name() -> &'static str {
 
 pub(crate) fn manifest_relative_path(generation: i64) -> PathBuf {
     PathBuf::from(granule_dir_name(generation)).join(manifest_file_name())
+}
+
+pub(crate) fn incoming_dir_name() -> &'static str {
+    "incoming"
+}
+
+pub(crate) fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<usize> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+    }
+
+    let mut payload = serde_json::to_vec(value)
+        .with_context(|| format!("failed to serialize json line {}", path.display()))?;
+    payload.push(b'\n');
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open append file {}", path.display()))?;
+    file.write_all(&payload)
+        .with_context(|| format!("failed to append file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync append file {}", path.display()))?;
+
+    Ok(payload.len())
+}
+
+pub(crate) fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open jsonl file {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut values = Vec::new();
+    for line in reader.lines() {
+        let line =
+            line.with_context(|| format!("failed to read jsonl line from {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        values.push(serde_json::from_str::<T>(&line).with_context(|| {
+            format!("failed to decode jsonl line from {}", path.display())
+        })?);
+    }
+
+    Ok(values)
 }
 
 fn parse_generation_dir_name(name: &str) -> Option<i64> {
