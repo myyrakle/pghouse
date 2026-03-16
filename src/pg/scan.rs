@@ -4,6 +4,7 @@ use crate::core::interface::{
     ChunkCodec, ColumnDescriptor, ColumnVector, EncodedColumnChunk, GranuleManifest, GranuleReader,
     GranuleRef, ScanBatch, ScanPlan, ScanPlanner, ScanRequest,
 };
+use crate::core::pk::{compare_optional_pk_text, pk_matches_bounds};
 use crate::core::scan::{MaterializedRow, build_scan_plan, materialize_row_entries};
 use crate::pg::catalog::{load_scan_granules, load_visible_insert_buffers};
 use anyhow::{Context, Result, anyhow, bail};
@@ -97,15 +98,42 @@ pub(crate) fn execute_scan(plan: &ScanPlan) -> Result<Vec<serde_json::Value>> {
         batches.push(reader.read_granule(plan, granule)?);
     }
 
-    let mut rows = materialize_row_entries(plan, &batches)?;
-    rows.extend(load_buffered_rows(plan)?);
-    rows.sort_by(|left, right| left.pk_text.cmp(&right.pk_text));
+    let rows = materialize_row_entries(plan, &batches)?;
+    let buffered_rows = load_buffered_rows(plan)?;
+    let mut rows = deduplicate_visible_rows(rows, buffered_rows);
+    rows.sort_by(|left, right| {
+        compare_optional_pk_text(
+            plan.table.pk_compare,
+            left.pk_text.as_deref(),
+            right.pk_text.as_deref(),
+        )
+    });
 
     if let Some(limit) = plan.limit {
         rows.truncate(limit);
     }
 
     Ok(rows.into_iter().map(|row| row.row).collect())
+}
+
+fn deduplicate_visible_rows(
+    granule_rows: Vec<MaterializedRow>,
+    buffered_rows: Vec<MaterializedRow>,
+) -> Vec<MaterializedRow> {
+    let mut deduped = std::collections::BTreeMap::new();
+    let mut rows_without_pk = Vec::new();
+
+    for row in granule_rows.into_iter().chain(buffered_rows) {
+        if let Some(pk_text) = row.pk_text.clone() {
+            deduped.insert(pk_text, row);
+        } else {
+            rows_without_pk.push(row);
+        }
+    }
+
+    let mut rows = deduped.into_values().collect::<Vec<_>>();
+    rows.extend(rows_without_pk);
+    rows
 }
 
 fn required_columns(plan: &ScanPlan) -> Vec<ColumnDescriptor> {
@@ -149,7 +177,8 @@ fn load_buffered_rows(plan: &ScanPlan) -> Result<Vec<MaterializedRow>> {
             .with_context(|| format!("failed to read insert buffer {}", path.display()))?;
         for staged_row in staged_rows {
             if !pk_matches_bounds(
-                &staged_row.pk_text,
+                plan.table.pk_compare,
+                Some(&staged_row.pk_text),
                 plan.pk_min.as_deref(),
                 plan.pk_max.as_deref(),
             ) {
@@ -179,14 +208,40 @@ fn project_row(row_json: &Value, projection: &[ColumnDescriptor]) -> Value {
     }
 }
 
-fn pk_matches_bounds(value: &str, pk_min: Option<&str>, pk_max: Option<&str>) -> bool {
-    if pk_min.is_some_and(|bound| value < bound) {
-        return false;
-    }
+#[cfg(test)]
+mod tests {
+    use super::deduplicate_visible_rows;
+    use crate::core::scan::MaterializedRow;
+    use serde_json::json;
 
-    if pk_max.is_some_and(|bound| value > bound) {
-        return false;
-    }
+    #[test]
+    fn buffered_rows_replace_duplicate_granule_rows() {
+        let rows = deduplicate_visible_rows(
+            vec![
+                MaterializedRow {
+                    pk_text: Some("1".to_string()),
+                    row: json!({"id": 1, "payload": "granule"}),
+                },
+                MaterializedRow {
+                    pk_text: Some("2".to_string()),
+                    row: json!({"id": 2, "payload": "granule"}),
+                },
+            ],
+            vec![
+                MaterializedRow {
+                    pk_text: Some("2".to_string()),
+                    row: json!({"id": 2, "payload": "buffer"}),
+                },
+                MaterializedRow {
+                    pk_text: Some("3".to_string()),
+                    row: json!({"id": 3, "payload": "buffer"}),
+                },
+            ],
+        );
 
-    true
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.row == json!({"id": 1, "payload": "granule"})));
+        assert!(rows.iter().any(|row| row.row == json!({"id": 2, "payload": "buffer"})));
+        assert!(rows.iter().any(|row| row.row == json!({"id": 3, "payload": "buffer"})));
+    }
 }

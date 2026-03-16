@@ -1,4 +1,5 @@
 use crate::core::interface::{ColumnDescriptor, GranuleRef, TableDescriptor};
+use crate::core::pk::{PkCompareMode, compare_pk_text};
 use anyhow::{Context, Result, anyhow, bail};
 use pgrx::prelude::*;
 use pgrx::spi::{quote_identifier, quote_qualified_identifier};
@@ -18,6 +19,7 @@ pub(crate) struct TableConfig {
     pub(crate) schema_name: String,
     pub(crate) relname: String,
     pub(crate) pk_column: String,
+    pub(crate) pk_compare: PkCompareMode,
     pub(crate) granule_rows: i32,
     pub(crate) compression: String,
     pub(crate) storage_root: String,
@@ -61,6 +63,7 @@ impl From<&TableConfig> for TableDescriptor {
             schema_name: value.schema_name.clone(),
             table_name: value.relname.clone(),
             pk_column: value.pk_column.clone(),
+            pk_compare: value.pk_compare,
             granule_rows: usize::try_from(value.granule_rows.max(1)).unwrap_or(1),
             compression: value.compression.clone(),
             storage_root: value.storage_root.clone(),
@@ -76,6 +79,7 @@ pgrx::extension_sql!(
         table_oid oid PRIMARY KEY,
         table_name regclass NOT NULL UNIQUE,
         pk_column name NOT NULL,
+        pk_compare text NOT NULL CHECK (pk_compare IN ('lexical', 'i64')),
         granule_rows integer NOT NULL CHECK (granule_rows > 0),
         compression text NOT NULL CHECK (compression IN ('zstd')),
         storage_root text NOT NULL,
@@ -257,6 +261,7 @@ pub(crate) fn relation_identity(table_name: &str) -> anyhow::Result<RelationIden
 pub(crate) fn upsert_table_config(
     identity: &RelationIdentity,
     pk_column: &str,
+    pk_compare: PkCompareMode,
     granule_rows: i32,
     compression: &str,
     storage_root: &str,
@@ -268,6 +273,7 @@ pub(crate) fn upsert_table_config(
         DatumWithOid::from(identity.table_oid),
         DatumWithOid::from(identity.table_oid),
         DatumWithOid::from(pk_column),
+        DatumWithOid::from(pk_compare.as_sql_label()),
         DatumWithOid::from(granule_rows),
         DatumWithOid::from(compression),
         DatumWithOid::from(storage_root),
@@ -282,6 +288,7 @@ pub(crate) fn upsert_table_config(
             table_oid,
             table_name,
             pk_column,
+            pk_compare,
             granule_rows,
             compression,
             storage_root,
@@ -298,11 +305,13 @@ pub(crate) fn upsert_table_config(
             $6,
             $7,
             $8,
-            $9
+            $9,
+            $10
         )
         ON CONFLICT (table_oid)
         DO UPDATE SET
             pk_column = EXCLUDED.pk_column,
+            pk_compare = EXCLUDED.pk_compare,
             granule_rows = EXCLUDED.granule_rows,
             compression = EXCLUDED.compression,
             storage_root = EXCLUDED.storage_root,
@@ -392,6 +401,7 @@ pub(crate) fn load_table_config(table_oid: i64) -> anyhow::Result<TableConfig> {
                 n.nspname::text AS schema_name,
                 c.relname::text AS relname,
                 t.pk_column::text AS pk_column,
+                t.pk_compare::text AS pk_compare,
                 t.granule_rows AS granule_rows,
                 t.compression::text AS compression,
                 t.storage_root::text AS storage_root,
@@ -417,6 +427,9 @@ pub(crate) fn load_table_config(table_oid: i64) -> anyhow::Result<TableConfig> {
                 pk_column: row
                     .get_by_name::<String, _>("pk_column")?
                     .unwrap_or_default(),
+                pk_compare: PkCompareMode::from_sql_label(
+                    &row.get_by_name::<String, _>("pk_compare")?.unwrap_or_default(),
+                ),
                 granule_rows: row
                     .get_by_name::<i32, _>("granule_rows")?
                     .unwrap_or_default(),
@@ -486,6 +499,30 @@ pub(crate) fn load_candidate_tables(max_tables: i32) -> anyhow::Result<Vec<i64>>
     Ok(table_oids)
 }
 
+pub(crate) fn try_acquire_table_maintenance_lock(table_oid: i64) -> anyhow::Result<bool> {
+    let args = [DatumWithOid::from(table_oid)];
+    Ok(Spi::get_one_with_args::<bool>(
+        "SELECT pg_try_advisory_lock($1::bigint)",
+        &args,
+    )?
+    .unwrap_or(false))
+}
+
+pub(crate) fn release_table_maintenance_lock(table_oid: i64) -> anyhow::Result<()> {
+    let args = [DatumWithOid::from(table_oid)];
+    let released = Spi::get_one_with_args::<bool>(
+        "SELECT pg_advisory_unlock($1::bigint)",
+        &args,
+    )?
+    .unwrap_or(false);
+
+    if !released {
+        bail!("failed to release maintenance lock for table oid {table_oid}");
+    }
+
+    Ok(())
+}
+
 pub(crate) fn load_pending_rows(
     table_oid: i64,
     limit: i32,
@@ -526,17 +563,19 @@ pub(crate) fn load_pending_rows(
     Ok(pending_rows)
 }
 
-pub(crate) fn load_live_rows(table_oid: i64) -> anyhow::Result<Vec<LiveRow>> {
+pub(crate) fn load_live_rows(
+    table_oid: i64,
+    pk_compare: PkCompareMode,
+) -> anyhow::Result<Vec<LiveRow>> {
     let args = [DatumWithOid::from(table_oid)];
 
-    let live_rows = Spi::connect(|client| -> Result<Vec<LiveRow>, spi::Error> {
+    let mut live_rows = Spi::connect(|client| -> Result<Vec<LiveRow>, spi::Error> {
         let rows = client.select(
             r#"
             SELECT pk_text::text AS pk_text, row_json::text AS row_json
             FROM pghouse.row_versions
             WHERE table_oid = $1::oid
               AND NOT deleted
-            ORDER BY pk_text
             "#,
             None,
             &args,
@@ -553,7 +592,33 @@ pub(crate) fn load_live_rows(table_oid: i64) -> anyhow::Result<Vec<LiveRow>> {
         Ok(live)
     })?;
 
+    live_rows.sort_by(|left, right| compare_pk_text(pk_compare, &left.pk_text, &right.pk_text));
     Ok(live_rows)
+}
+
+pub(crate) fn resolve_pk_compare_mode(
+    table_oid: i64,
+    pk_column: &str,
+) -> anyhow::Result<PkCompareMode> {
+    let args = [DatumWithOid::from(table_oid), DatumWithOid::from(pk_column)];
+    let typname = Spi::get_one_with_args::<String>(
+        r#"
+        SELECT t.typname::text
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = $1::oid
+          AND a.attname = $2::name
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        "#,
+        &args,
+    )?
+    .ok_or_else(|| anyhow!("PK column {pk_column} does not exist on table oid {table_oid}"))?;
+
+    Ok(match typname.as_str() {
+        "int2" | "int4" | "int8" | "oid" => PkCompareMode::I64,
+        _ => PkCompareMode::Lexical,
+    })
 }
 
 pub(crate) fn load_column_specs(table_oid: i64) -> anyhow::Result<Vec<ColumnSpec>> {

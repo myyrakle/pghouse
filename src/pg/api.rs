@@ -1,9 +1,11 @@
 use crate::core::file_layout::incoming_dir_name;
 use crate::core::interface::ScanRequest;
+use crate::core::pk::PkCompareMode;
 use crate::pg::catalog::{
     create_insert_buffer, enqueue_backfill, enqueue_merge, install_capture_trigger,
     load_active_insert_buffer, load_table_config, relation_identity, reset_sidecar_state,
-    resolve_projection, update_insert_buffer_after_append, upsert_table_config,
+    resolve_pk_compare_mode, resolve_projection, update_insert_buffer_after_append,
+    upsert_table_config,
 };
 use crate::pg::scan::{execute_scan, plan_scan};
 use crate::pg::storage::{
@@ -136,9 +138,11 @@ fn register_table(
 
     let identity = relation_identity(table_name)?;
     let storage_root = resolve_storage_root(identity.table_oid, storage_path)?;
+    let pk_compare = resolve_pk_compare_mode(identity.table_oid, pk_column)?;
     upsert_table_config(
         &identity,
         pk_column,
+        pk_compare,
         granule_rows,
         compression,
         &storage_root,
@@ -159,6 +163,10 @@ fn register_table(
         "schema": identity.schema_name,
         "table": identity.relname,
         "pk_column": pk_column,
+        "pk_compare": match pk_compare {
+            PkCompareMode::Lexical => "lexical",
+            PkCompareMode::I64 => "i64",
+        },
         "granule_rows": granule_rows,
         "compression": compression,
         "storage_root": storage_root,

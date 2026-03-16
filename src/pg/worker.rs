@@ -1,12 +1,14 @@
 use crate::core::codec::JsonArrayZstdCodec;
 use crate::core::file_layout::read_json_lines;
 use crate::core::interface::{ColumnDescriptor, RowVersion, SnapshotWriter};
+use crate::core::pk::compare_pk_text;
 use crate::core::snapshot::build_snapshot_write_request;
 use crate::pg::catalog::{
     InsertBuffer, TableConfig, apply_mutation, claim_ready_insert_buffers, dirty_row_count,
     load_candidate_tables, load_column_specs, load_live_rows, load_pending_rows, load_table_config,
     mark_flush_success, mark_insert_buffer_flushed, mark_merge_failure, next_generation,
-    pending_merge_count, release_insert_buffer_claim, upsert_buffered_row_version,
+    pending_merge_count, release_insert_buffer_claim, release_table_maintenance_lock,
+    try_acquire_table_maintenance_lock, upsert_buffered_row_version,
 };
 use crate::pg::storage::{FileSnapshotWriter, append_granules, insert_buffer_absolute_path};
 use anyhow::{Context, Result};
@@ -59,6 +61,22 @@ pub(crate) fn run_maintenance_cycle(
 }
 
 fn maintain_table(table_oid: i64, pending_limit: i32) -> Result<MaintenanceStats> {
+    if !try_acquire_table_maintenance_lock(table_oid)? {
+        return Ok(MaintenanceStats::default());
+    }
+
+    let result = maintain_table_locked(table_oid, pending_limit);
+    let unlock_result = release_table_maintenance_lock(table_oid);
+
+    match (result, unlock_result) {
+        (Ok(stats), Ok(())) => Ok(stats),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+fn maintain_table_locked(table_oid: i64, pending_limit: i32) -> Result<MaintenanceStats> {
     let config = load_table_config(table_oid)?;
 
     let mut stats = MaintenanceStats::default();
@@ -127,7 +145,6 @@ fn flush_insert_buffers(config: &TableConfig) -> Result<FlushStats> {
             &mut next_generation_value,
         ) {
             Ok(result) => {
-                mark_insert_buffer_flushed(buffer.id)?;
                 mark_flush_success(config.table_oid)?;
                 stats.rows_flushed += result.rows_flushed;
                 stats.granules_written += result.granules_written;
@@ -159,10 +176,17 @@ fn flush_single_insert_buffer(
     let absolute_path = insert_buffer_absolute_path(&config.storage_root, &buffer.storage_path);
     let mut rows = read_json_lines::<BufferedInsertRecord>(&absolute_path)?;
     if rows.is_empty() {
+        mark_insert_buffer_flushed(buffer.id)?;
+        fs::remove_file(&absolute_path).with_context(|| {
+            format!(
+                "failed to remove empty flushed insert buffer file {}",
+                absolute_path.display()
+            )
+        })?;
         return Ok(SingleBufferFlushResult::default());
     }
 
-    rows.sort_by(|left, right| left.pk_text.cmp(&right.pk_text));
+    rows.sort_by(|left, right| compare_pk_text(table.pk_compare, &left.pk_text, &right.pk_text));
 
     let mut row_versions = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -188,6 +212,7 @@ fn flush_single_insert_buffer(
     )?;
     let result = append_granules(&request)?;
     *next_generation_value += i64::try_from(result.granules_written).unwrap_or_default();
+    mark_insert_buffer_flushed(buffer.id)?;
     fs::remove_file(&absolute_path).with_context(|| {
         format!(
             "failed to remove flushed insert buffer file {}",
@@ -202,7 +227,7 @@ fn flush_single_insert_buffer(
 }
 
 fn rewrite_table_snapshot(config: &TableConfig) -> Result<usize> {
-    let live_rows = load_live_rows(config.table_oid)?;
+    let live_rows = load_live_rows(config.table_oid, config.pk_compare)?;
     let columns = load_column_specs(config.table_oid)?;
     let base_generation = next_generation(config.table_oid)?;
     let table = crate::core::interface::TableDescriptor::from(config);

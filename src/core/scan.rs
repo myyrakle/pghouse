@@ -1,4 +1,5 @@
 use crate::core::interface::{GranuleRef, ScanBatch, ScanPlan, ScanRequest};
+use crate::core::pk::{granule_overlaps, pk_matches_bounds};
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -24,7 +25,9 @@ pub(crate) fn build_scan_plan(
         }
 
         if !granule_overlaps(
-            granule,
+            request.table.pk_compare,
+            granule.pk_min.as_deref(),
+            granule.pk_max.as_deref(),
             request.pk_min.as_deref(),
             request.pk_max.as_deref(),
         ) {
@@ -73,6 +76,7 @@ pub(crate) fn materialize_row_entries(
         for row_index in 0..row_count {
             let pk_value = load_pk_value(plan, batch, row_index)?;
             if !pk_matches_bounds(
+                plan.table.pk_compare,
                 pk_value.as_deref(),
                 plan.pk_min.as_deref(),
                 plan.pk_max.as_deref(),
@@ -119,28 +123,6 @@ pub(crate) fn materialize_row_entries(
     Ok(rows)
 }
 
-fn granule_overlaps(granule: &GranuleRef, pk_min: Option<&str>, pk_max: Option<&str>) -> bool {
-    if let Some(pk_min) = pk_min
-        && granule
-            .pk_max
-            .as_deref()
-            .is_some_and(|value| value < pk_min)
-    {
-        return false;
-    }
-
-    if let Some(pk_max) = pk_max
-        && granule
-            .pk_min
-            .as_deref()
-            .is_some_and(|value| value > pk_max)
-    {
-        return false;
-    }
-
-    true
-}
-
 fn batch_row_count(batch: &ScanBatch) -> Result<usize> {
     let mut row_count = None;
     for column in &batch.columns {
@@ -184,22 +166,6 @@ fn load_pk_value(plan: &ScanPlan, batch: &ScanBatch, row_index: usize) -> Result
     Ok(value_to_pk_text(value))
 }
 
-fn pk_matches_bounds(value: Option<&str>, pk_min: Option<&str>, pk_max: Option<&str>) -> bool {
-    let Some(value) = value else {
-        return pk_min.is_none() && pk_max.is_none();
-    };
-
-    if pk_min.is_some_and(|bound| value < bound) {
-        return false;
-    }
-
-    if pk_max.is_some_and(|bound| value > bound) {
-        return false;
-    }
-
-    true
-}
-
 fn value_to_pk_text(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
@@ -216,6 +182,7 @@ mod tests {
     use crate::core::interface::{
         ColumnDescriptor, ColumnVector, GranuleRef, ScanBatch, ScanRequest, TableDescriptor,
     };
+    use crate::core::pk::PkCompareMode;
     use serde_json::json;
 
     fn test_table() -> TableDescriptor {
@@ -224,6 +191,7 @@ mod tests {
             schema_name: "public".to_string(),
             table_name: "events".to_string(),
             pk_column: "id".to_string(),
+            pk_compare: PkCompareMode::Lexical,
             granule_rows: 2,
             compression: "zstd".to_string(),
             storage_root: "/tmp/pghouse".to_string(),
