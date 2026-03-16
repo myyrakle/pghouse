@@ -135,13 +135,13 @@ fn flush_insert_buffers(config: &TableConfig) -> Result<FlushStats> {
     let mut next_generation_value = next_generation(config.table_oid)?;
     let mut stats = FlushStats::default();
 
-    for buffer in claimed_buffers {
+    for (index, buffer) in claimed_buffers.iter().enumerate() {
         match flush_single_insert_buffer(
             config,
             &table,
             &column_descriptors,
             &codec,
-            &buffer,
+            buffer,
             &mut next_generation_value,
         ) {
             Ok(result) => {
@@ -151,6 +151,9 @@ fn flush_insert_buffers(config: &TableConfig) -> Result<FlushStats> {
             }
             Err(error) => {
                 let _ = release_insert_buffer_claim(buffer.id);
+                for remaining in claimed_buffers.iter().skip(index + 1) {
+                    let _ = release_insert_buffer_claim(remaining.id);
+                }
                 return Err(error);
             }
         }
