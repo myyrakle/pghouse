@@ -1,31 +1,62 @@
-name: Compile Check (Cargo Build)
+name: Compile Check
 
 on:
   pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
+  push:
+    branches:
+      - main
+      - master
 
 jobs:
-  build_and_test:
-    name: Rust project - latest
-    strategy:
-      max-parallel: 3
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        toolchain:
-          - stable
-    runs-on: ${{ matrix.os }}
+  ubuntu-pgrx:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      DEBIAN_FRONTEND: noninteractive
+      PGRX_HOME: ${{ github.workspace }}/.pgrx
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo
-            ./target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
-      - run: cargo build
+      - name: Configure PostgreSQL APT repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg postgresql-common
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          sudo sh -c "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+          sudo apt-get update
+
+      - name: Install PostgreSQL and clang dependencies
+        run: |
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            llvm-dev \
+            libclang-dev \
+            pkg-config \
+            postgresql-18 \
+            postgresql-server-dev-18
+
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version 0.17.0
+
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+
+      - name: Compile extension
+        run: cargo check --features pg18
+
+      - name: Generate extension schema
+        run: cargo pgrx schema --features pg18 > /tmp/pghouse.sql
+
+      - name: Run unit tests
+        run: cargo test --lib core::scan::tests --features "pg18 pg_test" --no-default-features
